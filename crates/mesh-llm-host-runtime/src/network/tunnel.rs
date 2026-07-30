@@ -15,6 +15,15 @@ use tokio::net::TcpStream;
 /// Global byte counter for tunnel traffic
 static BYTES_TRANSFERRED: AtomicU64 = AtomicU64::new(0);
 
+const MAX_INBOUND_HTTP_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const INBOUND_HTTP_REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(10);
+const INBOUND_HTTP_TUNNEL_FORBIDDEN_RESPONSE: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\
+Content-Type: application/json\r\n\
+Content-Length: 97\r\n\
+Connection: close\r\n\
+\r\n\
+{\"error\":{\"message\":\"remote mesh HTTP tunnels only allow inference requests\",\"type\":\"forbidden\"}}";
+
 fn quic_response_first_byte_timeout() -> Duration {
     Duration::from_secs(5 * 60)
 }
@@ -100,17 +109,84 @@ impl Manager {
 /// Handle an inbound HTTP tunnel bi-stream: connect to the local API proxy and relay.
 async fn handle_inbound_http_stream(
     node: Node,
-    quic_send: iroh::endpoint::SendStream,
-    quic_recv: iroh::endpoint::RecvStream,
+    mut quic_send: iroh::endpoint::SendStream,
+    mut quic_recv: iroh::endpoint::RecvStream,
     http_port: u16,
 ) -> Result<()> {
+    let request_line = read_inbound_http_request_line(&mut quic_recv).await?;
+    if !is_allowed_inbound_http_tunnel_request(&request_line) {
+        tracing::warn!("Rejected non-inference inbound HTTP tunnel request");
+        quic_send
+            .write_all(INBOUND_HTTP_TUNNEL_FORBIDDEN_RESPONSE)
+            .await?;
+        quic_send.finish()?;
+        return Ok(());
+    }
+
     tracing::info!("Inbound HTTP tunnel stream -> API proxy :{http_port}");
     let tcp_stream = TcpStream::connect(format!("127.0.0.1:{http_port}")).await?;
     tcp_stream.set_nodelay(true)?;
     let _inflight = node.begin_inflight_request();
 
-    let (tcp_read, tcp_write) = tokio::io::split(tcp_stream);
+    let (tcp_read, mut tcp_write) = tokio::io::split(tcp_stream);
+    tcp_write.write_all(&request_line).await?;
     relay_bidirectional(tcp_read, tcp_write, quic_send, quic_recv).await
+}
+
+async fn read_inbound_http_request_line<R>(reader: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    tokio::time::timeout(
+        INBOUND_HTTP_REQUEST_LINE_TIMEOUT,
+        read_inbound_http_request_line_inner(reader),
+    )
+    .await
+    .context("timed out waiting for inbound HTTP tunnel request line")?
+}
+
+async fn read_inbound_http_request_line_inner<R>(reader: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut request_line = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    while request_line.len() < MAX_INBOUND_HTTP_REQUEST_LINE_BYTES {
+        let read = reader.read(&mut byte).await?;
+        if read == 0 {
+            anyhow::bail!("inbound HTTP tunnel closed before request line completed");
+        }
+        request_line.push(byte[0]);
+        if request_line.ends_with(b"\r\n") {
+            return Ok(request_line);
+        }
+    }
+    anyhow::bail!(
+        "inbound HTTP tunnel request line exceeded {} bytes",
+        MAX_INBOUND_HTTP_REQUEST_LINE_BYTES
+    )
+}
+
+fn is_allowed_inbound_http_tunnel_request(request_line: &[u8]) -> bool {
+    let Some(request_line) = request_line.strip_suffix(b"\r\n") else {
+        return false;
+    };
+    let Ok(request_line) = std::str::from_utf8(request_line) else {
+        return false;
+    };
+    let mut parts = request_line.split_ascii_whitespace();
+    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if parts.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return false;
+    }
+    let path = target.split('?').next().unwrap_or(target);
+    matches!(
+        (method, path),
+        ("GET", "/v1/models" | "/models") | ("POST", "/v1/chat/completions" | "/v1/responses")
+    )
 }
 
 async fn handle_inbound_stage_transport(
@@ -374,6 +450,75 @@ fn relay_remaining_chunks_error(total: u64, err: std::io::Error) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbound_http_tunnel_allows_inference_routes_only() {
+        for request_line in [
+            b"GET /v1/models HTTP/1.1\r\n".as_slice(),
+            b"GET /models?refresh=1 HTTP/1.1\r\n".as_slice(),
+            b"POST /v1/chat/completions HTTP/1.1\r\n".as_slice(),
+            b"POST /v1/responses?stream=true HTTP/1.0\r\n".as_slice(),
+        ] {
+            assert!(
+                is_allowed_inbound_http_tunnel_request(request_line),
+                "expected request to be allowed: {}",
+                String::from_utf8_lossy(request_line).trim_end()
+            );
+        }
+
+        for request_line in [
+            b"POST /mesh/load HTTP/1.1\r\n".as_slice(),
+            b"POST /mesh/drop HTTP/1.1\r\n".as_slice(),
+            b"GET /api/status HTTP/1.1\r\n".as_slice(),
+            b"POST /v1/models HTTP/1.1\r\n".as_slice(),
+            b"GET http://127.0.0.1:9337/v1/models HTTP/1.1\r\n".as_slice(),
+            b"CONNECT 127.0.0.1:3131 HTTP/1.1\r\n".as_slice(),
+            b"POST /v1/chat/completions HTTP/2\r\n".as_slice(),
+            b"POST /v1/chat/completions HTTP/1.1 extra\r\n".as_slice(),
+            b"POST /v1/chat/completions HTTP/1.1\n".as_slice(),
+        ] {
+            assert!(
+                !is_allowed_inbound_http_tunnel_request(request_line),
+                "expected request to be rejected: {}",
+                String::from_utf8_lossy(request_line).trim_end()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_http_tunnel_request_line_reader_preserves_remaining_bytes() {
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let request_line = read_inbound_http_request_line(&mut reader).await.unwrap();
+        assert_eq!(request_line, b"POST /v1/chat/completions HTTP/1.1\r\n");
+
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, b"Host: localhost\r\n\r\n{}");
+    }
+
+    #[tokio::test]
+    async fn inbound_http_tunnel_request_line_reader_rejects_oversized_lines() {
+        let (mut writer, mut reader) = tokio::io::duplex(MAX_INBOUND_HTTP_REQUEST_LINE_BYTES + 1);
+        tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'a'; MAX_INBOUND_HTTP_REQUEST_LINE_BYTES])
+                .await
+                .unwrap();
+        });
+
+        let error = read_inbound_http_request_line(&mut reader)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeded"));
+    }
 
     /// Simulate relay_bidirectional behavior when one direction finishes
     /// before the other — the scenario that caused the remote proxy bug.
