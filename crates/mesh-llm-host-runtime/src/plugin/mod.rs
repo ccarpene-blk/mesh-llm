@@ -1913,6 +1913,7 @@ mod tests {
     fn private_host_mode() -> PluginHostMode {
         PluginHostMode {
             mesh_visibility: MeshVisibility::Private,
+            include_installed_plugins: true,
         }
     }
 
@@ -2149,6 +2150,7 @@ mod tests {
             &MeshConfig::default(),
             PluginHostMode {
                 mesh_visibility: MeshVisibility::Public,
+                include_installed_plugins: true,
             },
         )
         .unwrap();

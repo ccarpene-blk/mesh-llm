@@ -800,6 +800,7 @@ async fn build_test_mesh_api_with_api_port(api_port: u16) -> MeshApi {
         &resolved_plugins,
         plugin::PluginHostMode {
             mesh_visibility: MeshVisibility::Private,
+            include_installed_plugins: true,
         },
         mesh_tx,
     )
@@ -1017,6 +1018,7 @@ async fn build_inference_endpoint_plugin_manager(models: &[&str]) -> plugin::Plu
         &resolved_plugins,
         plugin::PluginHostMode {
             mesh_visibility: MeshVisibility::Private,
+            include_installed_plugins: true,
         },
         mesh_tx,
     )

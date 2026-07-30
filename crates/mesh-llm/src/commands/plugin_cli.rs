@@ -165,6 +165,7 @@ fn plugin_host_mode(cli: &Cli) -> plugin::PluginHostMode {
         } else {
             mesh_llm_plugin::MeshVisibility::Private
         },
+        include_installed_plugins: true,
     }
 }
 

@@ -5623,6 +5623,7 @@ fn plugin_host_mode(options: &RuntimeOptions) -> plugin::PluginHostMode {
         } else {
             mesh_llm_plugin::MeshVisibility::Private
         },
+        include_installed_plugins: !options.peer_inference_only,
     }
 }
 
@@ -9711,6 +9712,7 @@ mod tests {
             &resolved_plugins,
             plugin::PluginHostMode {
                 mesh_visibility: mesh_llm_plugin::MeshVisibility::Private,
+                include_installed_plugins: true,
             },
             mesh_tx,
         )

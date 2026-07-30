@@ -1333,6 +1333,7 @@ async fn build_mesh_api_for_control_tests(node: Node) -> api::MeshApi {
         &resolved_plugins,
         plugin::PluginHostMode {
             mesh_visibility: mesh_llm_plugin::MeshVisibility::Private,
+            include_installed_plugins: true,
         },
         mesh_tx,
     )
@@ -1547,6 +1548,7 @@ async fn external_inference_endpoint_models_are_advertised_in_gossip() -> anyhow
         &resolved_plugins,
         plugin::PluginHostMode {
             mesh_visibility: mesh_llm_plugin::MeshVisibility::Private,
+            include_installed_plugins: true,
         },
         mesh_tx,
     )

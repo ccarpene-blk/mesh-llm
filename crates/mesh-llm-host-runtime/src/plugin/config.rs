@@ -279,9 +279,14 @@ pub struct ExternalPluginSpec {
 #[derive(Clone, Copy, Debug)]
 pub struct PluginHostMode {
     pub mesh_visibility: MeshVisibility,
+    /// Include plugins discovered from the process-wide installed plugin store.
+    ///
+    /// Embedded consumers can disable this to avoid importing ambient host
+    /// state into a restricted runtime surface.
+    pub include_installed_plugins: bool,
 }
 
-pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Result<ResolvedPlugins> {
+pub fn resolve_plugins(config: &MeshConfig, host_mode: PluginHostMode) -> Result<ResolvedPlugins> {
     let mut externals = Vec::new();
     let mut inactive = Vec::new();
     let mut names = BTreeMap::<String, ()>::new();
@@ -314,7 +319,9 @@ pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Resul
         }
     }
 
-    append_installed_plugins(&mut externals, &mut inactive, &mut names);
+    if host_mode.include_installed_plugins {
+        append_installed_plugins(&mut externals, &mut inactive, &mut names);
+    }
 
     if blobstore_enabled {
         externals.push(blobstore_plugin_spec()?);
@@ -362,6 +369,7 @@ mod tests {
         InstalledPluginVisibility, PluginStore,
     };
     use std::collections::BTreeSet;
+    use std::ffi::OsString;
     use tempfile::TempDir;
 
     const FULL_SURFACE_VALID_FIXTURE: &str =
@@ -508,6 +516,33 @@ mod tests {
         test(temp.path());
     }
 
+    struct PluginDirGuard {
+        previous: Option<OsString>,
+    }
+
+    impl PluginDirGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("MESH_LLM_PLUGIN_DIR");
+            // SAFETY: Tests that mutate the process-wide plugin dir env var are
+            // serialized, so no concurrent test observes a transient value.
+            unsafe { std::env::set_var("MESH_LLM_PLUGIN_DIR", path) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for PluginDirGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                // SAFETY: This restores the env var in the same serialized test
+                // scope that changed it.
+                Some(previous) => unsafe { std::env::set_var("MESH_LLM_PLUGIN_DIR", previous) },
+                // SAFETY: This restores the absence of the env var in the same
+                // serialized test scope that changed it.
+                None => unsafe { std::env::remove_var("MESH_LLM_PLUGIN_DIR") },
+            }
+        }
+    }
+
     fn parse_config_toml_with_plugin_store(raw: &str, store_root: &Path) -> Result<MeshConfig> {
         let config = base_parse_config_toml(raw)?;
         validate_config_with_plugin_schemas(&config, Some(raw), |plugin_name| {
@@ -586,6 +621,49 @@ command = "/tmp/demo"
         assert_eq!(config.models[1].gpu_id, None);
         assert_eq!(config.plugins.len(), 1);
         assert_eq!(config.plugins[0].name, "demo");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restricted_host_mode_does_not_import_ambient_installed_plugins() {
+        let temp = TempDir::new().unwrap();
+        let store = PluginStore::new(temp.path());
+        let mut ambient = installed_plugin_metadata("ambient-plugin", None);
+        ambient.install_path = temp.path().join("ambient-plugin-install");
+        std::fs::create_dir_all(&ambient.install_path).unwrap();
+        std::fs::write(ambient.executable_path(), b"").unwrap();
+        store.save(&ambient).unwrap();
+        let _guard = PluginDirGuard::set(temp.path());
+
+        let normal = resolve_plugins(
+            &MeshConfig::default(),
+            PluginHostMode {
+                mesh_visibility: MeshVisibility::Private,
+                include_installed_plugins: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            normal
+                .externals
+                .iter()
+                .any(|plugin| plugin.name == "ambient-plugin")
+        );
+
+        let restricted = resolve_plugins(
+            &MeshConfig::default(),
+            PluginHostMode {
+                mesh_visibility: MeshVisibility::Private,
+                include_installed_plugins: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            restricted
+                .externals
+                .iter()
+                .all(|plugin| plugin.name != "ambient-plugin")
+        );
     }
 
     #[test]
