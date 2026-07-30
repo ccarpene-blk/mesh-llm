@@ -450,6 +450,46 @@ fn relay_remaining_chunks_error(total: u64, err: std::io::Error) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::{NodeRole, QuicBindSelection, RelayConfig, RelayPolicy};
+    use std::collections::HashMap;
+    use tokio::sync::oneshot;
+
+    async fn start_test_node(role: NodeRole) -> Result<(Node, crate::mesh::TunnelChannels)> {
+        let relay_urls = Vec::new();
+        let relay_auths = HashMap::new();
+        Node::start(
+            role,
+            RelayConfig {
+                urls: &relay_urls,
+                auths: &relay_auths,
+                policy: RelayPolicy::Disabled,
+            },
+            QuicBindSelection {
+                ip: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                port: None,
+            },
+            Some(0.0),
+            false,
+            None,
+            None,
+            crate::MeshRequirements::unrestricted(),
+        )
+        .await
+    }
+
+    async fn wait_for_peer(node: &Node, peer_id: EndpointId) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if node.peers().await.iter().any(|peer| peer.id == peer_id) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("timed out waiting for test mesh peer")?;
+        Ok(())
+    }
 
     #[test]
     fn inbound_http_tunnel_allows_inference_routes_only() {
@@ -518,6 +558,84 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("exceeded"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_http_tunnel_forwards_inference_and_rejects_control_routes() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let http_port = listener.local_addr()?.port();
+        let (verify_second_accept_tx, verify_second_accept_rx) = oneshot::channel();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await?;
+                if read == 0 {
+                    anyhow::bail!("allowed test request closed before headers completed");
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            assert!(
+                request.starts_with(b"GET /v1/models HTTP/1.1\r\n"),
+                "expected allowed request to reach the local proxy: {}",
+                String::from_utf8_lossy(&request)
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await?;
+            stream.shutdown().await?;
+
+            verify_second_accept_rx.await?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err(),
+                "rejected control route must not open a local TCP connection"
+            );
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let (server, channels) = start_test_node(NodeRole::Host { http_port }).await?;
+        let tunnel_manager =
+            Manager::start(server.clone(), channels.rpc, channels.http, channels.stage).await?;
+        tunnel_manager.set_http_port(http_port);
+        server.start_accepting();
+
+        let (client, _channels) = start_test_node(NodeRole::Client).await?;
+        client.start_accepting();
+        client.join(&server.invite_token().await).await?;
+        wait_for_peer(&client, server.id()).await?;
+
+        let (mut allowed_send, mut allowed_recv) = client.open_http_tunnel(server.id()).await?;
+        allowed_send
+            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await?;
+        allowed_send.finish()?;
+        let allowed_response = allowed_recv.read_to_end(1024 * 1024).await?;
+        assert!(
+            allowed_response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "expected allowed route to be relayed: {}",
+            String::from_utf8_lossy(&allowed_response)
+        );
+
+        let (mut rejected_send, mut rejected_recv) = client.open_http_tunnel(server.id()).await?;
+        rejected_send
+            .write_all(b"POST /mesh/drop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .await?;
+        rejected_send.finish()?;
+        let rejected_response = rejected_recv.read_to_end(1024 * 1024).await?;
+        assert!(
+            rejected_response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"),
+            "expected rejected route to receive a 403: {}",
+            String::from_utf8_lossy(&rejected_response)
+        );
+
+        verify_second_accept_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("backend verification task ended early"))?;
+        backend.await??;
+        Ok(())
     }
 
     /// Simulate relay_bidirectional behavior when one direction finishes
