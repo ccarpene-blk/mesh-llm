@@ -150,6 +150,7 @@ fn runtime_options_from_cli(cli: mesh_llm_cli::Cli) -> mesh_llm_host_runtime::Ru
         headless: cli.headless,
         swarm_capture: cli.swarm_capture,
         publish: cli.publish,
+        peer_inference_only: false,
         mesh_name: cli.mesh_name,
         region: cli.region,
         min_node_version: cli.min_node_version,

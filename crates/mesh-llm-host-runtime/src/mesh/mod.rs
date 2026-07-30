@@ -2344,6 +2344,7 @@ pub struct Node {
     control_listener: Arc<Mutex<Option<ControlListenerLifecycle>>>,
     trust_store: Arc<Mutex<TrustStore>>,
     trust_policy: TrustPolicy,
+    peer_inference_only: bool,
     pub enumerate_host: bool,
     pub gpu_name: Option<String>,
     pub hostname: Option<String>,
@@ -2550,6 +2551,28 @@ pub(crate) fn stream_allowed_before_admission(stream_type: u8, trust_policy: Tru
         return false;
     }
     stream_type == STREAM_ROUTE_REQUEST || stream_type == STREAM_TUNNEL_HTTP
+}
+
+/// Returns `true` if an admitted peer may use the stream under the node's
+/// configured remote surface.
+///
+/// Inference-only embedded nodes still need mesh maintenance and routing
+/// streams, but must not expose raw tunnels, plugins, or stage-control
+/// subprotocols to peers.
+pub(crate) fn stream_allowed_for_peer_surface(stream_type: u8, peer_inference_only: bool) -> bool {
+    if !peer_inference_only {
+        return true;
+    }
+    matches!(
+        stream_type,
+        STREAM_GOSSIP
+            | STREAM_TUNNEL_MAP
+            | STREAM_TUNNEL_HTTP
+            | STREAM_ROUTE_REQUEST
+            | STREAM_PEER_DOWN
+            | STREAM_PEER_LEAVING
+            | STREAM_DIRECT_PATH_REQUEST
+    )
 }
 
 pub(crate) fn ingest_tunnel_map(
@@ -3708,6 +3731,7 @@ impl Node {
         quic_bind: QuicBindSelection,
         max_vram_gb: Option<f64>,
         enumerate_host: bool,
+        peer_inference_only: bool,
         owner_config: Option<OwnerRuntimeConfig>,
         config_path: Option<&std::path::Path>,
         local_mesh_requirements: crate::MeshRequirements,
@@ -3848,6 +3872,7 @@ impl Node {
             control_listener: Arc::new(Mutex::new(None)),
             trust_store: Arc::new(Mutex::new(owner_runtime.trust_store)),
             trust_policy: owner_runtime.trust_policy,
+            peer_inference_only,
             enumerate_host,
             gpu_name: hardware.gpu_name,
             hostname: hardware.hostname,
@@ -4010,6 +4035,7 @@ impl Node {
             control_listener: Arc::new(Mutex::new(None)),
             trust_store: Arc::new(Mutex::new(TrustStore::default())),
             trust_policy: TrustPolicy::Off,
+            peer_inference_only: false,
             enumerate_host: false,
             gpu_name: None,
             hostname: None,
@@ -6433,6 +6459,13 @@ impl Node {
         if alpn != skippy_protocol::STAGE_ALPN_V2 {
             return false;
         }
+        if self.peer_inference_only {
+            tracing::warn!(
+                "Rejected skippy stage connection from {}: node exposes inference-only peer surface",
+                remote.fmt_short()
+            );
+            return true;
+        }
         tracing::info!(
             "Inbound skippy stage connection from {}",
             remote.fmt_short()
@@ -6809,6 +6842,16 @@ impl Node {
         recv: iroh::endpoint::RecvStream,
     ) -> Option<MeshBiStream> {
         let capture_streams = self.swarm_capture_enabled();
+        if !stream_allowed_for_peer_surface(stream_type, self.peer_inference_only) {
+            return self.reject_peer_surface_stream(
+                remote,
+                protocol,
+                stream_type,
+                send,
+                recv,
+                capture_streams,
+            );
+        }
         if stream_allowed_before_admission(stream_type, self.trust_policy) {
             if capture_streams {
                 self.capture_stream_observation(remote, stream_type, protocol, true);
@@ -6834,6 +6877,28 @@ impl Node {
             drop((send, recv));
             None
         }
+    }
+
+    fn reject_peer_surface_stream(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        stream_type: u8,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+        capture_streams: bool,
+    ) -> Option<MeshBiStream> {
+        if capture_streams {
+            self.capture_stream_observation(remote, stream_type, protocol, false);
+        }
+        self.capture_stream_rejected(remote, stream_type, protocol, "peer_inference_only");
+        tracing::warn!(
+            "Rejected stream {:#04x} from {}: node exposes inference-only peer surface",
+            stream_type,
+            remote.fmt_short()
+        );
+        drop((send, recv));
+        None
     }
 
     async fn recover_closed_connection(&self, remote: EndpointId, closing_stable_id: usize) {

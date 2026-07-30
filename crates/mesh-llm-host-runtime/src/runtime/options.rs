@@ -40,6 +40,8 @@ pub struct RuntimeOptions {
     pub headless: bool,
     pub swarm_capture: Option<PathBuf>,
     pub publish: bool,
+    /// Restrict remote peers to mesh routing and OpenAI inference streams.
+    pub peer_inference_only: bool,
     pub mesh_name: Option<String>,
     pub region: Option<String>,
     pub min_node_version: Option<String>,
@@ -105,6 +107,7 @@ impl Default for RuntimeOptions {
             headless: false,
             swarm_capture: None,
             publish: false,
+            peer_inference_only: false,
             mesh_name: None,
             region: None,
             min_node_version: None,

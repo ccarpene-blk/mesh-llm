@@ -323,12 +323,32 @@ fn stage_load_request() -> crate::inference::skippy::StageLoadRequest {
 }
 
 async fn make_test_node(role: super::NodeRole) -> Result<Node> {
-    make_test_node_with_requirements(role, crate::MeshRequirements::unrestricted()).await
+    make_test_node_with_peer_surface(role, false).await
+}
+
+async fn make_test_node_with_peer_surface(
+    role: super::NodeRole,
+    peer_inference_only: bool,
+) -> Result<Node> {
+    make_test_node_with_requirements_and_peer_surface(
+        role,
+        crate::MeshRequirements::unrestricted(),
+        peer_inference_only,
+    )
+    .await
 }
 
 async fn make_test_node_with_requirements(
     role: super::NodeRole,
     local_mesh_requirements: crate::MeshRequirements,
+) -> Result<Node> {
+    make_test_node_with_requirements_and_peer_surface(role, local_mesh_requirements, false).await
+}
+
+async fn make_test_node_with_requirements_and_peer_surface(
+    role: super::NodeRole,
+    local_mesh_requirements: crate::MeshRequirements,
+    peer_inference_only: bool,
 ) -> Result<Node> {
     use iroh::endpoint::QuicTransportConfig;
 
@@ -432,6 +452,7 @@ async fn make_test_node_with_requirements(
         control_listener: Arc::new(Mutex::new(None)),
         trust_store: Arc::new(Mutex::new(TrustStore::default())),
         trust_policy: TrustPolicy::Off,
+        peer_inference_only,
         enumerate_host: false,
         gpu_name: None,
         hostname: None,
@@ -8225,4 +8246,85 @@ fn passive_streams_are_gated_when_trust_policy_enforces_ownership() {
             policy
         ));
     }
+}
+
+#[test]
+fn inference_only_peer_surface_keeps_routing_but_blocks_extended_capabilities() {
+    for stream_type in [
+        STREAM_GOSSIP,
+        STREAM_TUNNEL_MAP,
+        STREAM_TUNNEL_HTTP,
+        STREAM_ROUTE_REQUEST,
+        STREAM_PEER_DOWN,
+        STREAM_PEER_LEAVING,
+        STREAM_DIRECT_PATH_REQUEST,
+    ] {
+        assert!(
+            stream_allowed_for_peer_surface(stream_type, true),
+            "stream {stream_type:#04x} is required for mesh routing or inference"
+        );
+    }
+
+    for stream_type in [
+        STREAM_TUNNEL,
+        STREAM_PLUGIN_CHANNEL,
+        STREAM_PLUGIN_BULK_TRANSFER,
+        STREAM_PLUGIN_MESH_STREAM,
+        STREAM_SUBPROTOCOL,
+    ] {
+        assert!(
+            !stream_allowed_for_peer_surface(stream_type, true),
+            "stream {stream_type:#04x} must stay off the inference-only peer surface"
+        );
+    }
+
+    assert!(
+        stream_allowed_for_peer_surface(STREAM_PLUGIN_CHANNEL, false),
+        "default MeshLLM behavior must preserve the full peer surface"
+    );
+}
+
+#[tokio::test]
+async fn inference_only_peer_surface_rejects_stage_control_after_admission() -> Result<()> {
+    use base64::Engine as _;
+
+    let server =
+        make_test_node_with_peer_surface(super::NodeRole::Host { http_port: 9337 }, true).await?;
+    let client = make_test_node(super::NodeRole::Worker).await?;
+    server
+        .set_mesh_id("inference-only-stage-test".to_string())
+        .await;
+    client
+        .set_mesh_id("inference-only-stage-test".to_string())
+        .await;
+    server.start_accepting();
+    client.start_accepting();
+
+    let server_id = server.id();
+    let client_id = client.id();
+    let invite = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&server.endpoint.addr())?);
+    client.join(&invite).await?;
+    wait_for_peer(&client, server_id).await;
+    wait_for_peer(&server, client_id).await;
+
+    let request = crate::inference::skippy::StageControlRequest::Inventory(
+        crate::inference::skippy::StageInventoryRequest {
+            model_id: "model-a".to_string(),
+            package_ref: "gguf:///model.gguf".to_string(),
+            manifest_sha256: "direct-gguf:1:model.gguf".to_string(),
+        },
+    );
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        client.send_stage_control(server_id, request),
+    )
+    .await
+    .expect("inference-only stage rejection must not hang");
+    assert!(
+        result.is_err(),
+        "stage control must be rejected when the peer surface is inference-only"
+    );
+
+    Ok(())
 }

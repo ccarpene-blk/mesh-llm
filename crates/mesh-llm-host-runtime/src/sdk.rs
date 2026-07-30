@@ -215,6 +215,7 @@ fn embedded_runtime_options(
         mesh_name: config.network.mesh_name.clone(),
         max_vram_gb: config.serving.max_vram_gb,
         publish: config.network.publish,
+        peer_inference_only: config.network.peer_inference_only,
         discovery_mode: match config.network.discovery_mode {
             EmbeddedMeshDiscoveryMode::Nostr => crate::runtime::EmbeddedRuntimeDiscoveryMode::Nostr,
             EmbeddedMeshDiscoveryMode::Mdns => crate::runtime::EmbeddedRuntimeDiscoveryMode::Mdns,
@@ -798,6 +799,7 @@ mod tests {
             .iroh_relay("https://relay.example")
             .iroh_relay_auth("https://relay.example", "token")
             .disable_iroh_relays(true)
+            .peer_inference_only(true)
             .nostr_relay("wss://nostr.example")
             .bind_port(17777)
             .owner_key("/tmp/sprout-owner.json")
@@ -817,6 +819,7 @@ mod tests {
         assert_eq!(options.console_port, 13131);
         assert_eq!(options.mesh_name.as_deref(), Some("sprout"));
         assert_eq!(options.max_vram_gb, Some(3.0));
+        assert!(options.peer_inference_only);
         assert_embedded_runtime_network_options(&options);
         assert_embedded_runtime_admission_options(&options);
         assert_eq!(options.log_format, mesh_llm_events::LogFormat::Json);

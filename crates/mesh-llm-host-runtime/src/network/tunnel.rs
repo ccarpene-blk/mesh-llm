@@ -454,7 +454,10 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
-    async fn start_test_node(role: NodeRole) -> Result<(Node, crate::mesh::TunnelChannels)> {
+    async fn start_test_node(
+        role: NodeRole,
+        peer_inference_only: bool,
+    ) -> Result<(Node, crate::mesh::TunnelChannels)> {
         let relay_urls = Vec::new();
         let relay_auths = HashMap::new();
         Node::start(
@@ -470,6 +473,7 @@ mod tests {
             },
             Some(0.0),
             false,
+            peer_inference_only,
             None,
             None,
             crate::MeshRequirements::unrestricted(),
@@ -596,13 +600,13 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         });
 
-        let (server, channels) = start_test_node(NodeRole::Host { http_port }).await?;
+        let (server, channels) = start_test_node(NodeRole::Host { http_port }, true).await?;
         let tunnel_manager =
             Manager::start(server.clone(), channels.rpc, channels.http, channels.stage).await?;
         tunnel_manager.set_http_port(http_port);
         server.start_accepting();
 
-        let (client, _channels) = start_test_node(NodeRole::Client).await?;
+        let (client, _channels) = start_test_node(NodeRole::Client, false).await?;
         client.start_accepting();
         client.join(&server.invite_token().await).await?;
         wait_for_peer(&client, server.id()).await?;

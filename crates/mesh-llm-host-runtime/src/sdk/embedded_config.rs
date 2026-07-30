@@ -86,6 +86,11 @@ pub struct EmbeddedMeshNetworkConfig {
     pub auto_join: bool,
     pub discovery_mode: EmbeddedMeshDiscoveryMode,
     pub publish: bool,
+    /// Restrict admitted peers to the routing and OpenAI inference protocol surface.
+    ///
+    /// This keeps embedded consumers from exposing plugin, Skippy stage-control,
+    /// or other non-inference mesh capabilities to remote peers.
+    pub peer_inference_only: bool,
     pub mesh_name: Option<String>,
     pub region: Option<String>,
     pub node_name: Option<String>,
@@ -106,6 +111,7 @@ impl Default for EmbeddedMeshNetworkConfig {
             auto_join: false,
             discovery_mode: EmbeddedMeshDiscoveryMode::Nostr,
             publish: false,
+            peer_inference_only: false,
             mesh_name: None,
             region: None,
             node_name: None,
@@ -270,6 +276,11 @@ impl EmbeddedMeshNodeBuilder {
 
     pub fn publish(mut self, enabled: bool) -> Self {
         self.config.network.publish = enabled;
+        self
+    }
+
+    pub fn peer_inference_only(mut self, enabled: bool) -> Self {
+        self.config.network.peer_inference_only = enabled;
         self
     }
 
@@ -489,6 +500,7 @@ pub struct EmbeddedServeConfig {
     pub mesh_name: Option<String>,
     pub max_vram_gb: Option<f64>,
     pub publish: bool,
+    pub peer_inference_only: bool,
     pub discovery_mode: EmbeddedMeshDiscoveryMode,
     pub relay: Vec<String>,
     pub relay_auth: BTreeMap<String, String>,
@@ -520,6 +532,7 @@ impl Default for EmbeddedServeConfig {
             mesh_name: None,
             max_vram_gb: None,
             publish: false,
+            peer_inference_only: false,
             discovery_mode: EmbeddedMeshDiscoveryMode::Nostr,
             relay: Vec::new(),
             relay_auth: BTreeMap::new(),
@@ -559,6 +572,7 @@ impl From<EmbeddedServeConfig> for EmbeddedMeshNodeConfig {
                 auto_join: config.auto,
                 discovery_mode: config.discovery_mode,
                 publish: config.publish,
+                peer_inference_only: config.peer_inference_only,
                 mesh_name: config.mesh_name,
                 region: config.region,
                 node_name: config.node_name,
@@ -594,6 +608,7 @@ impl From<EmbeddedMeshNodeConfig> for EmbeddedServeConfig {
             mesh_name: config.network.mesh_name,
             max_vram_gb: config.serving.max_vram_gb,
             publish: config.network.publish,
+            peer_inference_only: config.network.peer_inference_only,
             discovery_mode: config.network.discovery_mode,
             relay: config.network.iroh_relays,
             relay_auth: config.network.iroh_relay_auth,
